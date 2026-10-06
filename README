@@ -1,5 +1,5 @@
-daemon-fp-listen
-================
+fp-listen
+=========
 
 fp-listen, the FreshPorts daemon that listens for database notifications
 and clears caches. Built and distributed as the FreeBSD package
@@ -11,8 +11,13 @@ repository (svn+ssh://svn.int.unixathome.org/freshports-1). README.md in
 FreshPorts/daemontools describes that conversion. The split is done by
 split-daemontools.sh in ~/src/freshports/git-conversion/.
 
-It is not FreshPorts/fp-listen, an earlier conversion (January 2025) with
-SVN's trunk/branches/tags as plain directories and no git tags.
+It replaces an earlier conversion, now FreshPorts/archive.fp-listen. Despite
+its name, that one held all of daemontools as of 2024-11-07, with SVN's
+trunk/, branches/ and tags/ as plain directories and no git tags. Its
+fp-listen content is identical to this repository's: branches/git/fp-listen
+matches main, trunk/fp-listen matches trunk, and the same 58 SVN revisions
+changed fp-listen in both. The one difference is fp-listen-1.0.1, which
+there still holds the nested copy described below.
 
 
 Where the code lived
@@ -75,7 +80,7 @@ release is a git tag named for the version; the port can fetch it with:
 
   USE_GITHUB=	yes
   GH_ACCOUNT=	FreshPorts
-  GH_PROJECT=	daemon-fp-listen
+  GH_PROJECT=	fp-listen
 
 
 Not converted
