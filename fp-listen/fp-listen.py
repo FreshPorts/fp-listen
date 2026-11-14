@@ -24,7 +24,42 @@ from pathlib import Path # for removing files from cache dir
 config = configparser.ConfigParser()
 config.read('/usr/local/etc/freshports/fp-listen.ini')
 
-DSN = 'host=' + config['database']['HOST'] + ' dbname=' + config['database']['DBNAME'] + ' user=' + config['database']['DBUSER'] + ' password=' + config['database']['PASSWORD'] + "sslmode='require'"
+def ini_value(value):
+  # fp-listen.ini writes some values the libpq way, in single quotes:
+  # DBNAME = 'freshports.org', PASSWORD = ''.  Take the quotes off, and
+  # undo \' and \\ inside them, as libpq does.
+  if len(value) >= 2 and value[0] == "'" and value[-1] == "'":
+    value = value[1:-1].replace("\\'", "'").replace("\\\\", "\\")
+  return value
+
+#
+# The connection settings, given to psycopg2.connect() one by one.
+#
+# They used to be pasted into one DSN string, ending
+#   ' password=' + PASSWORD + "sslmode='require'"
+# with no space before sslmode.  That worked only because the password is
+# written in quotes: an unquoted password became "s3cretsslmode='require'",
+# so the login failed, or under trust or cert authentication sslmode was
+# never set and the connection did not require SSL.
+#
+# The keepalives are for the LISTEN connection, which is idle most of the
+# time.  Without them a connection which died quietly (a failover, a
+# firewall dropping its state) looked the same as one with nothing to say,
+# until the operating system's own keepalive, about two hours.  With these
+# it is found within about two minutes, and fp-listen exits to be
+# restarted.
+#
+DB = {
+  'host':     ini_value(config['database']['HOST']),
+  'dbname':   ini_value(config['database']['DBNAME']),
+  'user':     ini_value(config['database']['DBUSER']),
+  'password': ini_value(config['database']['PASSWORD']),
+  'sslmode':  'require',
+  'keepalives':          1,
+  'keepalives_idle':     60,
+  'keepalives_interval': 10,
+  'keepalives_count':    6,
+}
 
 def remove_glob(filenameglob):
   """Remove every file and directory matching filenameglob.
@@ -62,7 +97,7 @@ def remove_glob(filenameglob):
 def RemovePortsCacheEntry():
   something_cleared = False
   syslog.syslog(syslog.LOG_NOTICE, 'checking for file entries to remove...')
-  dbh = psycopg2.connect(DSN)
+  dbh = psycopg2.connect(**DB)
   curs = dbh.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
   # rows whose files could not all be removed: left in the queue for a
@@ -119,7 +154,7 @@ def RemoveFilesCacheEntry():
   #
   something_cleared = False
   syslog.syslog(syslog.LOG_NOTICE, 'checking for cache file entries to remove...')
-  dbh = psycopg2.connect(DSN)
+  dbh = psycopg2.connect(**DB)
   curs = dbh.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
   # rows whose files could not all be removed: left in the queue for a
@@ -196,7 +231,7 @@ def PackagesCacheClear():
 
 def CommitsCacheClear():
   glob_templates = [ 'COMMIT_CACHE_PATH', 'SANITY_CACHE_PATH', 'SANITY_MAIN_CACHE_PATH' ]
-  dbh = psycopg2.connect(DSN)
+  dbh = psycopg2.connect(**DB)
   curs = dbh.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
   curs.execute("SELECT commit_to_clear FROM cache_clearing_commits")
@@ -235,7 +270,7 @@ def CommitsCacheClear():
 
 def ClearDateCacheEntries():
   syslog.syslog(syslog.LOG_NOTICE, 'checking for cache date to remove...')
-  dbh = psycopg2.connect(DSN)
+  dbh = psycopg2.connect(**DB)
   curs = dbh.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
   curs.execute("SELECT id, date_to_clear FROM cache_clearing_dates ORDER BY id")
@@ -335,7 +370,7 @@ syslog.openlog(ident='fp-listen', facility=syslog.LOG_LOCAL3)
 
 syslog.syslog(syslog.LOG_NOTICE, 'Starting up - this should not occur often')
 
-conn = psycopg2.connect(DSN)
+conn = psycopg2.connect(**DB)
 conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
 
 curs = conn.cursor()
