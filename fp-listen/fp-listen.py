@@ -25,73 +25,78 @@ config.read('/usr/local/etc/freshports/fp-listen.ini')
 
 DSN = 'host=' + config['database']['HOST'] + ' dbname=' + config['database']['DBNAME'] + ' user=' + config['database']['DBUSER'] + ' password=' + config['database']['PASSWORD'] + "sslmode='require'"
 
+def remove_glob(filenameglob):
+  """Remove every file and directory matching filenameglob.
+
+  Returns True if nothing matching is left, False if anything could not be
+  removed.  Each match is tried on its own: a file which has already gone is
+  fine, and any other error is logged and the rest are still tried.
+
+  The four handlers below used to wrap the whole loop in one try.  A file
+  which vanished between glob() and the delete stopped the loop, so the
+  rest of that port's cached pages stayed stale, and the queue row was then
+  deleted as if all had been cleared.  Any other error (e.g. PermissionError
+  on a directory another user created) kept the row, and in the two
+  handlers which loop until their queue is empty, the same row was then
+  read and tried again at once, for ever, with no sleep: fp-listen spun at
+  full CPU and handled no other notification.  In CommitsCacheClear, which
+  caught only FileNotFoundError, such an error ended fp-listen instead.
+  """
+  syslog.syslog(syslog.LOG_NOTICE, 'removing glob %s' % (filenameglob))
+  all_removed = True
+  for filename in glob.glob(filenameglob):
+    syslog.syslog(syslog.LOG_NOTICE, 'removing %s' % (filename))
+    try:
+      if os.path.isdir(filename) and not os.path.islink(filename):
+        shutil.rmtree(filename)
+      else:
+        os.remove(filename)
+    except FileNotFoundError:
+      syslog.syslog(syslog.LOG_NOTICE, 'already gone: %s' % (filename))
+    except OSError as e:
+      syslog.syslog(syslog.LOG_CRIT, 'ERROR: could not remove %s: %s' % (filename, e))
+      all_removed = False
+  return all_removed
+
 def RemovePortsCacheEntry():
   something_cleared = False
   syslog.syslog(syslog.LOG_NOTICE, 'checking for file entries to remove...')
   dbh = psycopg2.connect(DSN)
   curs = dbh.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
+  # rows whose files could not all be removed: left in the queue for a
+  # later notification, and not tried again in this call
+  failed = set()
+
   # we loop until nothing is found to delete. See comment at end of loop.
   while 1:
     syslog.syslog(syslog.LOG_NOTICE, 'at the top of the loop looking for cache port entries to remove...')
     curs.execute("SELECT id, port_id, category, port FROM cache_clearing_ports ORDER BY id")
-    NumRows = curs.rowcount
+    rows = [row for row in curs.fetchall() if row['id'] not in failed]
+    NumRows = len(rows)
     dbh.commit();
     if (NumRows > 0):
       something_cleared = True
       syslog.syslog(syslog.LOG_NOTICE, 'COUNT: %d entries to process' % (NumRows))
-      rows = curs.fetchall()
       for row in rows:
-        #
-        # first, we clear the port cache
-        #
-        filenameglob = config['dirs']['PORT_CACHE_PATH'] % (row['category'], row['port'])
-        syslog.syslog(syslog.LOG_NOTICE, 'removing glob %s' % (filenameglob))
+        # first the port's cache, then its category's
+        port_removed     = remove_glob(config['dirs']['PORT_CACHE_PATH'] % (row['category'], row['port']))
+        category_removed = remove_glob(config['dirs']['CATEGORY_CACHE_PATH'] % (row['category']))
 
-        try:
-          for filename in glob.glob(filenameglob):
-            syslog.syslog(syslog.LOG_NOTICE, 'removing %s' % (filename))
-            if os.path.isfile(filename):
-              os.remove(filename)
-            else:
-              shutil.rmtree(filename)
-
-        except FileNotFoundError:
-          syslog.syslog(syslog.LOG_CRIT, 'could not find file for deletion %s' % (filename))
-
-        except:
-          syslog.syslog(syslog.LOG_CRIT, 'ERROR: error deleting cache port entry.  Error message is %s' % (sys.exc_info()[0]))
-          # if we can't delete it, do not remove it from cache
-          continue
-
-        #
-        # then we delete the category cache
-        #
-        filenameglob = config['dirs']['CATEGORY_CACHE_PATH'] % (row['category'])
-        syslog.syslog(syslog.LOG_NOTICE, 'removing glob %s' % (filenameglob))
-        try:
-          for filename in glob.glob(filenameglob):
-            syslog.syslog(syslog.LOG_NOTICE, 'removing %s' % (filename))
-            if os.path.isfile(filename):
-              os.remove(filename)
-            else:
-              shutil.rmtree(filename)
-
-        except FileNotFoundError:
-          syslog.syslog(syslog.LOG_CRIT, 'could not find file for deletion %s' % (filename))
-
-        except:
-          syslog.syslog(syslog.LOG_CRIT, 'ERROR: error deleting port entry.  Error message is %s' % (sys.exc_info()[0]))
-          # if we can't delete it, do not remove it from cache
+        if not (port_removed and category_removed):
+          # if we can't delete it, do not remove it from the queue
+          failed.add(row['id'])
           continue
 
         syslog.syslog(syslog.LOG_NOTICE, "DELETE FROM cache_clearing_ports WHERE id = %d" % (row['id']))
-        curs.execute("DELETE FROM cache_clearing_ports WHERE id = %d" % (row['id']))
+        curs.execute("DELETE FROM cache_clearing_ports WHERE id = %s", (row['id'],))
         dbh.commit()
       # end for
       syslog.syslog(syslog.LOG_NOTICE, 'at the bottom of the loop looking for port entries to remove...')
     else:
-      if something_cleared:
+      if failed:
+        syslog.syslog(syslog.LOG_ERR, 'ERROR: %d cached port entries could not be removed; left in cache_clearing_ports' % len(failed))
+      elif something_cleared:
         syslog.syslog(syslog.LOG_NOTICE, 'No cached port entries found for removal')
       else:
         syslog.syslog(syslog.LOG_ERR, 'ERROR: No cached entries found for removal')
@@ -116,16 +121,20 @@ def RemoveFilesCacheEntry():
   dbh = psycopg2.connect(DSN)
   curs = dbh.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
+  # rows whose files could not all be removed: left in the queue for a
+  # later notification, and not tried again in this call
+  failed = set()
+
   # we loop until nothing is found to delete. See comment at end of loop.
   while 1:
     syslog.syslog(syslog.LOG_NOTICE, 'at the top of the loop looking for cache file entries to remove...')
     curs.execute("SELECT id, pathname FROM cache_clearing_files ORDER BY id")
-    NumRows = curs.rowcount
+    rows = [row for row in curs.fetchall() if row['id'] not in failed]
+    NumRows = len(rows)
     dbh.commit();
     if (NumRows > 0):
       something_cleared = True
       syslog.syslog(syslog.LOG_NOTICE, 'COUNT: %d entries to process' % (NumRows))
-      rows = curs.fetchall()
       for row in rows:
         #
         # we clear the file cache, which be in src, doc, or ports?
@@ -140,33 +149,20 @@ def RemoveFilesCacheEntry():
         pathname = row['pathname'].replace('/ports/head/', '/')
 
         syslog.syslog(syslog.LOG_NOTICE, 'we would be removing: %s' % pathname)
-        filenameglob = config['dirs']['FILE_CACHE_PATH'] % (pathname)
-        syslog.syslog(syslog.LOG_NOTICE, 'removing glob %s' % (filenameglob))
-
-        try:
-          for filename in glob.glob(filenameglob):
-            syslog.syslog(syslog.LOG_NOTICE, 'removing %s' % (filename))
-            if os.path.isfile(filename):
-              os.remove(filename)
-            else:
-              shutil.rmtree(filename)
-
-        except FileNotFoundError:
-          syslog.syslog(syslog.LOG_CRIT, 'could not find file for deletion %s' % (filename))
-
-        except:
-          syslog.syslog(syslog.LOG_CRIT, 'ERROR: error deleting cache entry.  Error message is %s' % (sys.exc_info()[0]))
-          # if we can't delete it, do not remove it from cache
+        if not remove_glob(config['dirs']['FILE_CACHE_PATH'] % (pathname)):
+          # if we can't delete it, do not remove it from the queue
+          failed.add(row['id'])
           continue
 
-
         syslog.syslog(syslog.LOG_NOTICE, "DELETE FROM cache_clearing_files WHERE id = %d" % (row['id']))
-        curs.execute("DELETE FROM cache_clearing_files WHERE id = %d" % (row['id']))
+        curs.execute("DELETE FROM cache_clearing_files WHERE id = %s", (row['id'],))
         dbh.commit()
       # end for
       syslog.syslog(syslog.LOG_NOTICE, 'at the bottom of the loop looking for cache entries to remove...')
     else:
-      if something_cleared:
+      if failed:
+        syslog.syslog(syslog.LOG_ERR, 'ERROR: %d cached file entries could not be removed; left in cache_clearing_files' % len(failed))
+      elif something_cleared:
         syslog.syslog(syslog.LOG_NOTICE, 'No cached entries found for removal')
       else:
         syslog.syslog(syslog.LOG_ERR, 'ERROR: No cached entries found for removal')
@@ -209,28 +205,23 @@ def CommitsCacheClear():
     syslog.syslog(syslog.LOG_NOTICE, 'COUNT: %d entries to process' % (NumRows))
     rows = curs.fetchall()
     for row in rows:
+      all_removed = True
       for template in glob_templates:
         if (template == 'SANITY_MAIN_CACHE_PATH'):
           filenameglob = config['dirs'][template]
         else:
           filenameglob = config['dirs'][template] % (row['commit_to_clear'])
 
-        syslog.syslog(syslog.LOG_NOTICE, 'removing glob %s' % (filenameglob))
-        
-        try:
-          for filename in glob.glob(filenameglob):
-            syslog.syslog(syslog.LOG_NOTICE, 'removing %s' % (filename))
-            if os.path.isfile(filename):
-              os.remove(filename)
-            else:
-              shutil.rmtree(filename)
-
-        except FileNotFoundError:
-          syslog.syslog(syslog.LOG_CRIT, 'could not find file for deletion %s' % (filename))
+        if not remove_glob(filenameglob):
+          all_removed = False
       # endfor templates
-    
+
+      if not all_removed:
+        # if we can't delete it, do not remove it from the queue
+        continue
+
       syslog.syslog(syslog.LOG_NOTICE, "DELETE FROM cache_clearing_commits WHERE commit_to_clear = '%s'" % (row['commit_to_clear']))
-      curs.execute("DELETE FROM cache_clearing_commits WHERE commit_to_clear = '%s'" % (row['commit_to_clear']))
+      curs.execute("DELETE FROM cache_clearing_commits WHERE commit_to_clear = %s", (row['commit_to_clear'],))
       dbh.commit()
 
     # end for rows
@@ -255,26 +246,12 @@ def ClearDateCacheEntries():
     for row in rows:
       syslog.syslog(syslog.LOG_NOTICE, 'looking at %s' % (row['date_to_clear']))
       filenameglob = config['dirs']['DATE_CACHE_PATH'] % (row['date_to_clear'].strftime('%Y'), row['date_to_clear'].strftime('%m'), row['date_to_clear'].strftime('%d'))
-      syslog.syslog(syslog.LOG_NOTICE, 'removing glob %s' % (filenameglob))
-
-      try:
-        for filename in glob.glob(filenameglob):
-          syslog.syslog(syslog.LOG_NOTICE, 'removing %s' % (filename))
-          if os.path.isfile(filename):
-            os.remove(filename)
-          else:
-            shutil.rmtree(filename)
-
-      except FileNotFoundError:
-        syslog.syslog(syslog.LOG_CRIT, 'could not find file for deletion %s' % (filename))
-        pass  # no file to delete, so no worries
-
-      except:
-        syslog.syslog(syslog.LOG_CRIT, 'ERROR: error deleting cache entry.  Error message is %s' % (sys.exc_info()[0]))
+      if not remove_glob(filenameglob):
+        # if we can't delete it, do not remove it from the queue
         continue
 
       syslog.syslog(syslog.LOG_NOTICE, "DELETE FROM cache_clearing_dates WHERE id = %d" % (row['id']))
-      curs.execute("DELETE FROM cache_clearing_dates WHERE id = %d" % (row['id']))
+      curs.execute("DELETE FROM cache_clearing_dates WHERE id = %s", (row['id'],))
       dbh.commit()
 
     # end for
