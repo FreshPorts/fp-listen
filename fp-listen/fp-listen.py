@@ -17,6 +17,7 @@ import glob	# for glob
 import shutil	# for rmtree
 
 import configparser # for fp-listen.ini parsing
+import traceback    # for logging a handler's error
 
 from pathlib import Path # for removing files from cache dir
 
@@ -313,6 +314,23 @@ def ClearMiscCaches():
          
 
 
+def run_safely(name, handler):
+  #
+  # An error in one handler is logged, and fp-listen carries on with the
+  # next notification.  Nothing used to catch them: a failed connect, an
+  # SQL error, or an OSError a handler did not expect ended the process.
+  # The rc.d script restarts it (daemon -r), but the notification was lost
+  # and, until the queues are drained at startup (below), so were the rows
+  # queued while it was down.
+  #
+  try:
+    handler()
+  except Exception:
+    syslog.syslog(syslog.LOG_ERR, 'ERROR: %s failed; carrying on:' % (name))
+    for line in traceback.format_exc().splitlines():
+      syslog.syslog(syslog.LOG_ERR, '  ' + line)
+
+
 syslog.openlog(ident='fp-listen', facility=syslog.LOG_LOCAL3)
 
 syslog.syslog(syslog.LOG_NOTICE, 'Starting up - this should not occur often')
@@ -332,11 +350,34 @@ for listen in listens_for:
   listens[listen[0]] = listen[1]
   syslog.syslog(syslog.LOG_NOTICE, "('%s', '%s')" % (listen[0], listen[1]))
 
+#
+# Now that we are listening, clear whatever was queued while fp-listen was
+# not: during a restart, or before this start.  Those rows used to wait for
+# the next notification on the same channel, and their pages were served
+# stale meanwhile.  Anything queued from here on also sends a NOTIFY, which
+# the loop below sees.
+#
+syslog.syslog(syslog.LOG_NOTICE, 'clearing anything queued while we were not listening')
+run_safely('RemovePortsCacheEntry', RemovePortsCacheEntry)
+run_safely('RemoveFilesCacheEntry', RemoveFilesCacheEntry)
+run_safely('CommitsCacheClear',     CommitsCacheClear)
+run_safely('ClearDateCacheEntries', ClearDateCacheEntries)
+run_safely('ClearMiscCaches',       ClearMiscCaches)
+
 while 1:
   if select.select([conn],[],[],5)==([],[],[]):
     syslog.syslog(syslog.LOG_NOTICE, 'timeout! *************')
   else:
-    conn.poll()
+    #
+    # Losing the LISTEN connection (e.g. PostgreSQL restarted) is not
+    # something to carry on from: exit, and let daemon -r start us again,
+    # which LISTENs afresh and clears whatever was queued meanwhile.
+    #
+    try:
+      conn.poll()
+    except psycopg2.Error as e:
+      syslog.syslog(syslog.LOG_CRIT, 'ERROR: lost the LISTEN connection (%s); exiting, to be restarted' % (str(e).strip()))
+      sys.exit(1)
     syslog.syslog(syslog.LOG_NOTICE, 'Just woke up! *************')
     while conn.notifies:
       notify = conn.notifies.pop(0);
@@ -350,34 +391,34 @@ while 1:
 
         if  listens[notify.channel] == 'listen_port':
           syslog.syslog(syslog.LOG_NOTICE, "invoking RemovePortsCacheEntry()");
-          RemovePortsCacheEntry()
+          run_safely('RemovePortsCacheEntry', RemovePortsCacheEntry)
         elif listens[notify.channel] == 'listen_file_updated':
           syslog.syslog(syslog.LOG_NOTICE, "invoking RemoveFilesCacheEntry()");
-          RemoveFilesCacheEntry()
+          run_safely('RemoveFilesCacheEntry', RemoveFilesCacheEntry)
         elif listens[notify.channel] == 'listen_ports_moved':
           syslog.syslog(syslog.LOG_NOTICE, "invoking ProcessPortsMoved()");
-          ProcessPortsMoved()
+          run_safely('ProcessPortsMoved', ProcessPortsMoved)
         elif listens[notify.channel] == 'listen_ports_updating':
           syslog.syslog(syslog.LOG_NOTICE, "invoking ProcessPortsUpdating()");
-          ProcessPortsUpdating()
+          run_safely('ProcessPortsUpdating', ProcessPortsUpdating)
         elif listens[notify.channel] == 'listen_vuxml':
           syslog.syslog(syslog.LOG_NOTICE, "invoking ProcessVUXML()");
-          ProcessVUXML()
+          run_safely('ProcessVUXML', ProcessVUXML)
         elif listens[notify.channel] == 'listen_category_new':
           syslog.syslog(syslog.LOG_NOTICE, "invoking ProcessCategoryNew()");
-          ProcessCategoryNew()
+          run_safely('ProcessCategoryNew', ProcessCategoryNew)
         elif listens[notify.channel] == 'listen_date_updated':
           syslog.syslog(syslog.LOG_NOTICE, "invoking ClearDateCacheEntries()");
-          ClearDateCacheEntries()
+          run_safely('ClearDateCacheEntries', ClearDateCacheEntries)
         elif listens[notify.channel] == 'listen_packages_imported':
           syslog.syslog(syslog.LOG_NOTICE, "invoking PackagesCacheClear()");
-          PackagesCacheClear()
+          run_safely('PackagesCacheClear', PackagesCacheClear)
           # at the time of writing, there was no reason to ClearMiscCaches() when
           # new packages arrive
           clear_cache = False;
         elif listens[notify.channel] == 'listen_commit':
           syslog.syslog(syslog.LOG_NOTICE, "invoking CommitsClearCache()");
-          CommitsCacheClear()
+          run_safely('CommitsCacheClear', CommitsCacheClear)
         else:
           clear_cache = False;
           syslog.syslog(syslog.LOG_ERR, "Code does not know what to do when '%s' is found." % notify.channel)
@@ -385,7 +426,7 @@ while 1:
           
         if clear_cache:
           syslog.syslog(syslog.LOG_NOTICE, "invoking ClearMiscCaches()");
-          ClearMiscCaches()
+          run_safely('ClearMiscCaches', ClearMiscCaches)
 
       else:
         syslog.syslog(syslog.LOG_NOTICE, 'no such key in listens array for %s!' % (notify.channel))
