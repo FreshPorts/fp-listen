@@ -329,21 +329,22 @@ def ClearMiscCaches():
   news_cache_dir = config['dirs']['NEWS_CACHE_DIR'];
   syslog.syslog(syslog.LOG_NOTICE, 'ClearMiscCaches() is clearing out entries in %s' % (news_cache_dir));
 
-  for filename in Path(news_cache_dir).iterdir():
-    syslog.syslog(syslog.LOG_NOTICE, 'ClearMiscCaches() is removing %s' % (filename))
-    try:
-      if Path(filename).is_file():
-        Path(filename).unlink()
-      else:
-        shutil.rmtree(filename)
-    
-    except FileNotFoundError:
-      syslog.syslog(syslog.LOG_CRIT, 'could not find file for deletion %s' % (filename))
-      pass  # no file to delete, so no worries
-
-    except:
-      syslog.syslog(syslog.LOG_CRIT, 'ERROR: error deleting cache entry.  Error message is %s' % (sys.exc_info()[0]))
-      continue
+  #
+  # Through remove_glob(), like the other caches.  This used to call
+  # Path(news_cache_dir).iterdir() outside any try, so a missing news cache
+  # directory (a new host, or someone clearing the cache with rm -rf) raised
+  # FileNotFoundError after every port, file, date or commit notification.
+  # A missing directory now matches nothing.
+  #
+  # The directory is the website's NEWS_DIRECTORY: the cached home page,
+  # ports-new.php and the port list pages, and the RSS/Atom feeds, all of
+  # which go stale with each commit.  '*' does not match dot files, but the
+  # website names nothing there with a leading dot; feed.php's temporary
+  # files (feed-tmp.*) are matched and removed, as iterdir() did too.
+  #
+  if not os.path.isdir(news_cache_dir):
+    syslog.syslog(syslog.LOG_NOTICE, 'ClearMiscCaches(): %s does not exist; nothing to clear' % (news_cache_dir))
+  remove_glob(os.path.join(news_cache_dir, '*'))
 
   syslog.syslog(syslog.LOG_NOTICE, 'finished: ClearMiscCaches()');
          
