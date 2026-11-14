@@ -19,7 +19,6 @@ import shutil	# for rmtree
 import configparser # for fp-listen.ini parsing
 import traceback    # for logging a handler's error
 
-from pathlib import Path # for removing files from cache dir
 
 config = configparser.ConfigParser()
 config.read('/usr/local/etc/freshports/fp-listen.ini')
@@ -135,7 +134,11 @@ def RemovePortsCacheEntry():
       elif something_cleared:
         syslog.syslog(syslog.LOG_NOTICE, 'No cached port entries found for removal')
       else:
-        syslog.syslog(syslog.LOG_ERR, 'ERROR: No cached entries found for removal')
+        # Normal, not an error: an earlier notification's run, or the
+        # startup run, already cleared what this notification was for.
+        # This used to be logged at LOG_ERR as "ERROR: No cached entries
+        # found for removal", once for each such notification.
+        syslog.syslog(syslog.LOG_NOTICE, 'nothing queued')
       #
       # we stay in this loop until there are no entries to remove
       # this avoids the race condition where more entries are added
@@ -201,7 +204,8 @@ def RemoveFilesCacheEntry():
       elif something_cleared:
         syslog.syslog(syslog.LOG_NOTICE, 'No cached entries found for removal')
       else:
-        syslog.syslog(syslog.LOG_ERR, 'ERROR: No cached entries found for removal')
+        # normal, not an error: see RemovePortsCacheEntry()
+        syslog.syslog(syslog.LOG_NOTICE, 'nothing queued')
       #
       # we stay in this loop until there are no entries to remove
       # this avoids the race condition where more entries are added
@@ -262,7 +266,8 @@ def CommitsCacheClear():
 
     # end for rows
   else:
-    syslog.syslog(syslog.LOG_ERR, 'ERROR: No cached entries found for removal')
+    # normal, not an error: see RemovePortsCacheEntry()
+    syslog.syslog(syslog.LOG_NOTICE, 'nothing queued')
   # end if
     
   syslog.syslog(syslog.LOG_NOTICE, 'finished')
@@ -292,18 +297,12 @@ def ClearDateCacheEntries():
 
     # end for
   else:
-    syslog.syslog(syslog.LOG_ERR, 'ERROR: No cached entries found for removal')
+    # normal, not an error: see RemovePortsCacheEntry()
+    syslog.syslog(syslog.LOG_NOTICE, 'nothing queued')
   # end if
     
   syslog.syslog(syslog.LOG_NOTICE, 'finished')
   return NumRows
-
-
-def Touch(File):
-  if not os.path.exists(File):
-    fd = open(File, 'aos.O_WRONLY | os.O_NONBLOCK | os.O_CREAT | os.O_NOCTTY | os.O_APPEND')
-    fd.close()
-  os.utime(File, None)
 
 
 def ProcessCategoryNew():
@@ -400,9 +399,21 @@ run_safely('CommitsCacheClear',     CommitsCacheClear)
 run_safely('ClearDateCacheEntries', ClearDateCacheEntries)
 run_safely('ClearMiscCaches',       ClearMiscCaches)
 
+IDLE_SECONDS = 300
+
 while 1:
-  if select.select([conn],[],[],5)==([],[],[]):
-    syslog.syslog(syslog.LOG_NOTICE, 'timeout! *************')
+  #
+  # Wait up to IDLE_SECONDS for a notification; select() returns as soon
+  # as one arrives, so this does not slow anything down.  When none came,
+  # log one line, so the log shows fp-listen is still alive.
+  #
+  # From 78bc05c (2017-01-26, the move to psycopg2) until November 2026,
+  # nearly ten years, this waited 5 seconds and logged "timeout! *********"
+  # each time: 17,280 lines a day.  Every 5 minutes is 288.  Before 2017 the
+  # select() had no timeout at all, and logged nothing while idle.
+  #
+  if select.select([conn],[],[],IDLE_SECONDS)==([],[],[]):
+    syslog.syslog(syslog.LOG_NOTICE, 'idle: no notification in the last %d seconds' % (IDLE_SECONDS))
   else:
     #
     # Losing the LISTEN connection (e.g. PostgreSQL restarted) is not
@@ -467,4 +478,3 @@ while 1:
       else:
         syslog.syslog(syslog.LOG_NOTICE, 'no such key in listens array for %s!' % (notify.channel))
 
-logging.error('terminating')
