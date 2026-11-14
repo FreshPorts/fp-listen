@@ -93,13 +93,30 @@ def remove_glob(filenameglob):
       all_removed = False
   return all_removed
 
+#
+# Each handler takes a row off its queue before clearing the files, not
+# after.
+#
+# The ingress, and the triggers it fires, queue a row with
+# INSERT ... ON CONFLICT ... DO NOTHING: one row per port, or per pathname.
+# The row used to be deleted after the files were removed.  A change to the
+# same port committed in between found the old row still there, so its
+# insert did nothing; then the old row was deleted.  A page rebuilt from the
+# old data in that gap stayed cached, and nothing was left in the queue to
+# clear it.  Taking the row first leaves no row for the newer insert to
+# collide with: it queues a new row, which the next pass, or the
+# notification sent with it, clears.
+#
+# If the files cannot all be removed, the row goes back on the queue, so a
+# later notification tries again.
+#
 def RemovePortsCacheEntry():
   something_cleared = False
   syslog.syslog(syslog.LOG_NOTICE, 'checking for file entries to remove...')
   dbh = psycopg2.connect(**DB)
   curs = dbh.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-  # rows whose files could not all be removed: left in the queue for a
+  # ports whose files could not all be removed: put back on the queue for a
   # later notification, and not tried again in this call
   failed = set()
 
@@ -107,25 +124,28 @@ def RemovePortsCacheEntry():
   while 1:
     syslog.syslog(syslog.LOG_NOTICE, 'at the top of the loop looking for cache port entries to remove...')
     curs.execute("SELECT id, port_id, category, port FROM cache_clearing_ports ORDER BY id")
-    rows = [row for row in curs.fetchall() if row['id'] not in failed]
+    rows = [row for row in curs.fetchall() if row['port_id'] not in failed]
     NumRows = len(rows)
     dbh.commit();
     if (NumRows > 0):
       something_cleared = True
       syslog.syslog(syslog.LOG_NOTICE, 'COUNT: %d entries to process' % (NumRows))
       for row in rows:
+        # take it off the queue first; see the comment above this function
+        syslog.syslog(syslog.LOG_NOTICE, "DELETE FROM cache_clearing_ports WHERE id = %d" % (row['id']))
+        curs.execute("DELETE FROM cache_clearing_ports WHERE id = %s", (row['id'],))
+        dbh.commit()
+
         # first the port's cache, then its category's
         port_removed     = remove_glob(config['dirs']['PORT_CACHE_PATH'] % (row['category'], row['port']))
         category_removed = remove_glob(config['dirs']['CATEGORY_CACHE_PATH'] % (row['category']))
 
         if not (port_removed and category_removed):
-          # if we can't delete it, do not remove it from the queue
-          failed.add(row['id'])
-          continue
-
-        syslog.syslog(syslog.LOG_NOTICE, "DELETE FROM cache_clearing_ports WHERE id = %d" % (row['id']))
-        curs.execute("DELETE FROM cache_clearing_ports WHERE id = %s", (row['id'],))
-        dbh.commit()
+          # put it back, unless a newer request already has
+          curs.execute("INSERT INTO cache_clearing_ports (port_id, category, port) VALUES (%s, %s, %s) ON CONFLICT DO NOTHING",
+                       (row['port_id'], row['category'], row['port']))
+          dbh.commit()
+          failed.add(row['port_id'])
       # end for
       syslog.syslog(syslog.LOG_NOTICE, 'at the bottom of the loop looking for port entries to remove...')
     else:
@@ -160,15 +180,15 @@ def RemoveFilesCacheEntry():
   dbh = psycopg2.connect(**DB)
   curs = dbh.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
-  # rows whose files could not all be removed: left in the queue for a
-  # later notification, and not tried again in this call
+  # pathnames whose files could not all be removed: put back on the queue
+  # for a later notification, and not tried again in this call
   failed = set()
 
   # we loop until nothing is found to delete. See comment at end of loop.
   while 1:
     syslog.syslog(syslog.LOG_NOTICE, 'at the top of the loop looking for cache file entries to remove...')
     curs.execute("SELECT id, pathname FROM cache_clearing_files ORDER BY id")
-    rows = [row for row in curs.fetchall() if row['id'] not in failed]
+    rows = [row for row in curs.fetchall() if row['pathname'] not in failed]
     NumRows = len(rows)
     dbh.commit();
     if (NumRows > 0):
@@ -187,15 +207,17 @@ def RemoveFilesCacheEntry():
         # change /ports/head/MOVED
         pathname = row['pathname'].replace('/ports/head/', '/')
 
-        syslog.syslog(syslog.LOG_NOTICE, 'we would be removing: %s' % pathname)
-        if not remove_glob(config['dirs']['FILE_CACHE_PATH'] % (pathname)):
-          # if we can't delete it, do not remove it from the queue
-          failed.add(row['id'])
-          continue
-
+        # take it off the queue first; see the comment above RemovePortsCacheEntry()
         syslog.syslog(syslog.LOG_NOTICE, "DELETE FROM cache_clearing_files WHERE id = %d" % (row['id']))
         curs.execute("DELETE FROM cache_clearing_files WHERE id = %s", (row['id'],))
         dbh.commit()
+
+        syslog.syslog(syslog.LOG_NOTICE, 'we would be removing: %s' % pathname)
+        if not remove_glob(config['dirs']['FILE_CACHE_PATH'] % (pathname)):
+          # put it back, unless a newer request already has
+          curs.execute("INSERT INTO cache_clearing_files (pathname) VALUES (%s) ON CONFLICT DO NOTHING", (row['pathname'],))
+          dbh.commit()
+          failed.add(row['pathname'])
       # end for
       syslog.syslog(syslog.LOG_NOTICE, 'at the bottom of the loop looking for cache entries to remove...')
     else:
@@ -245,6 +267,11 @@ def CommitsCacheClear():
     syslog.syslog(syslog.LOG_NOTICE, 'COUNT: %d entries to process' % (NumRows))
     rows = curs.fetchall()
     for row in rows:
+      # take it off the queue first; see the comment above RemovePortsCacheEntry()
+      syslog.syslog(syslog.LOG_NOTICE, "DELETE FROM cache_clearing_commits WHERE commit_to_clear = '%s'" % (row['commit_to_clear']))
+      curs.execute("DELETE FROM cache_clearing_commits WHERE commit_to_clear = %s", (row['commit_to_clear'],))
+      dbh.commit()
+
       all_removed = True
       for template in glob_templates:
         if (template == 'SANITY_MAIN_CACHE_PATH'):
@@ -257,12 +284,9 @@ def CommitsCacheClear():
       # endfor templates
 
       if not all_removed:
-        # if we can't delete it, do not remove it from the queue
-        continue
-
-      syslog.syslog(syslog.LOG_NOTICE, "DELETE FROM cache_clearing_commits WHERE commit_to_clear = '%s'" % (row['commit_to_clear']))
-      curs.execute("DELETE FROM cache_clearing_commits WHERE commit_to_clear = %s", (row['commit_to_clear'],))
-      dbh.commit()
+        # put it back, unless a newer request already has
+        curs.execute("INSERT INTO cache_clearing_commits (commit_to_clear) VALUES (%s) ON CONFLICT DO NOTHING", (row['commit_to_clear'],))
+        dbh.commit()
 
     # end for rows
   else:
@@ -286,14 +310,16 @@ def ClearDateCacheEntries():
     rows = curs.fetchall()
     for row in rows:
       syslog.syslog(syslog.LOG_NOTICE, 'looking at %s' % (row['date_to_clear']))
-      filenameglob = config['dirs']['DATE_CACHE_PATH'] % (row['date_to_clear'].strftime('%Y'), row['date_to_clear'].strftime('%m'), row['date_to_clear'].strftime('%d'))
-      if not remove_glob(filenameglob):
-        # if we can't delete it, do not remove it from the queue
-        continue
-
+      # take it off the queue first; see the comment above RemovePortsCacheEntry()
       syslog.syslog(syslog.LOG_NOTICE, "DELETE FROM cache_clearing_dates WHERE id = %d" % (row['id']))
       curs.execute("DELETE FROM cache_clearing_dates WHERE id = %s", (row['id'],))
       dbh.commit()
+
+      filenameglob = config['dirs']['DATE_CACHE_PATH'] % (row['date_to_clear'].strftime('%Y'), row['date_to_clear'].strftime('%m'), row['date_to_clear'].strftime('%d'))
+      if not remove_glob(filenameglob):
+        # put it back
+        curs.execute("INSERT INTO cache_clearing_dates (date_to_clear) VALUES (%s)", (row['date_to_clear'],))
+        dbh.commit()
 
     # end for
   else:
